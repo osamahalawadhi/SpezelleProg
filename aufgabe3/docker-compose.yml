@@ -1,0 +1,9 @@
+services:
+  builder:
+    build: ./app
+    volumes:
+      - data:/data
+    command: ["bash", "-lc", "python main.py && echo 'Fertig – warte 10 Minuten...' && sleep 600"]
+
+volumes:
+  data:
