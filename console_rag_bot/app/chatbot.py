@@ -1,0 +1,189 @@
+# app/chatbot.py
+import os
+import sys
+import json
+import re
+import requests
+from textwrap import fill
+from openai import OpenAI
+
+# ---------- Einstellungen (hier anpassen) ----------
+OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip() or "your api key"
+
+# Qdrant-Server (macOS/Windows lokal meist via host.docker.internal)
+QDRANT_URL = (os.environ.get("QDRANT_URL") or "").strip() or "http://host.docker.internal:6333"   # ggf. "http://qdrant:6333", wenn Qdrant im gleichen Compose-Netz läuft
+COLLECTION = (os.environ.get("QDRANT_COLLECTION") or "").strip() or "thema_ki"
+
+# Embedding-Modell muss zur Collection passen (z. B. text-embedding-3-small → 1536 Dimensionen)
+EMBED_MODEL = "text-embedding-3-small"
+
+# Retrieval-Parameter (etwas toleranter gewählt)
+TOP_K = int((os.environ.get("TOP_K") or "").strip() or 5)
+MIN_SCORE = float((os.environ.get("MIN_SCORE") or "").strip() or 0.65)    # 0..1 (1 = sehr ähnlich)
+
+# Konsolenanzeige
+WRAP_COLS = 100     # Zeilenumbruchbreite
+# ---------------------------------------------------------
+
+def fatal(msg: str, code: int = 2):
+    print(f"Fehler: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+def embed_query(client: OpenAI, text: str):
+    resp = client.embeddings.create(model=EMBED_MODEL, input=[text])
+    return resp.data[0].embedding
+
+def qdrant_search(vector):
+    url = f"{QDRANT_URL}/collections/{COLLECTION}/points/search"
+    body = {
+        "vector": vector,
+        "limit": TOP_K,
+        "with_payload": True,
+        "with_vector": False
+    }
+    r = requests.post(url, headers={"Content-Type":"application/json"}, data=json.dumps(body), timeout=60)
+    if r.status_code >= 400:
+        fatal(f"Qdrant-Suche fehlgeschlagen ({r.status_code}): {r.text}", 3)
+    data = r.json()
+    return data.get("result", [])
+
+def qdrant_scroll_by_tag(tag):
+    """Einfacher, rein DB-basierter Fallback über Tags im Payload."""
+    url = f"{QDRANT_URL}/collections/{COLLECTION}/points/scroll"
+    body = {
+        "limit": 3,
+        "with_payload": True,
+        "with_vector": False,
+        "filter": {"must": [ {"key": "tags", "match": {"value": tag}} ]}
+    }
+    r = requests.post(url, headers={"Content-Type":"application/json"}, data=json.dumps(body), timeout=60)
+    if r.status_code >= 400:
+        return []  # leise fehlschlagen, Hauptpfad bleibt maßgeblich
+    data = r.json()
+    return (data.get("result") or {}).get("points", [])
+
+def answer_from_hits(hits):
+    """
+    Gibt nur Inhalte aus Qdrant wieder. Keine Generierung.
+    Wenn die besten Treffer unter MIN_SCORE liegen, wird eine neutrale Antwort ausgegeben.
+    """
+    if not hits:
+        return "Ich weiß es nicht auf Basis der vorhandenen Daten."
+
+    best_score = hits[0].get("score", 0.0)
+    if best_score < MIN_SCORE:
+        return "Ich weiß es nicht auf Basis der vorhandenen Daten."
+
+    lines = []
+    for i, h in enumerate(hits, start=1):
+        score = h.get("score", 0.0)
+        payload = h.get("payload", {}) or {}
+        title   = payload.get("title", f"Treffer {i}")
+        content = payload.get("content", "")
+        source  = payload.get("source", "unbekannt")
+        doc_id  = payload.get("doc_id", "-")
+        chunk_id = payload.get("chunk_id", "-")
+
+        lines.append(f"[{i}] {title} (score={score:.3f})")
+        if content:
+            lines.append(fill(content, width=WRAP_COLS))
+        lines.append(f"Quelle: {source} | doc_id={doc_id} | chunk={chunk_id}")
+        lines.append("")
+
+    return "\n".join(lines).strip()
+
+def startup_check():
+    """Kurzer Reachability-Check für Qdrant/Collection."""
+    try:
+        url = f"{QDRANT_URL}/collections/{COLLECTION}"
+        r = requests.get(url, timeout=5)
+        if r.status_code == 200:
+            return True
+        print(f"Warnung: Collection-Check gab Status {r.status_code} zurück.", file=sys.stderr)
+        return False
+    except Exception as e:
+        print(f"Warnung: Collection-Check fehlgeschlagen: {e}", file=sys.stderr)
+        return False
+
+def main():
+    if not OPENAI_API_KEY or OPENAI_API_KEY.strip() == "" or "HIER_DEIN_OPENAI_API_KEY_EINTRAGEN" in OPENAI_API_KEY:
+        fatal("Bitte OPENAI_API_KEY in chatbot.py eintragen.", 2)
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+
+    print("Console-Chatbot (Qdrant, nur Datenbankinhalte).")
+    print("Frage eingeben und Enter drücken. Mit ':exit' beenden.")
+    print(f"Collection: {COLLECTION} @ {QDRANT_URL}")
+    print(f"Schwellwert (MIN_SCORE): {MIN_SCORE} | Top-K: {TOP_K}")
+    ok = startup_check()
+    if not ok:
+        print("Hinweis: Konnte Collection nicht sicher prüfen. Fahre dennoch fort.", file=sys.stderr)
+    print("-" * 60)
+
+    # sehr einfache Tag-Erkennung (nur Beispiele)
+    tag_map = {
+        r"\banwendungs?\w*\b": "Anwendungen",
+        r"\bgesundheitswesen\b": "Gesundheitswesen",
+        r"\bautomatisier": "Automatisierung",
+        r"\bgrundlagen?\b": "Grundlagen",
+        r"\bmaschinell(es|e)? lernen\b|\bml\b": "Maschinelles Lernen",
+    }
+
+    try:
+        while True:
+            try:
+                question = input("> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print("\nTschüss.")
+                break
+
+            if not question:
+                continue
+            if question.lower() in {":exit", "exit", "quit", ":q"}:
+                print("Tschüss.")
+                break
+
+            # 1) Query-Embedding
+            try:
+                vec = embed_query(client, question)
+            except Exception as e:
+                print(f"Embedding-Fehler: {e}", file=sys.stderr)
+                continue
+
+            # 2) Qdrant-Suche
+            try:
+                hits = qdrant_search(vec)
+            except Exception as e:
+                print(f"Qdrant-Fehler: {e}", file=sys.stderr)
+                continue
+
+            # Debug: Scores zeigen
+            try:
+                print("Top-Scores:", [ round(h.get("score", 0.0), 3) for h in hits ])
+            except Exception:
+                pass
+
+            # 3) Optionaler Fallback: Wenn Score zu niedrig, versuche Tag-Scroll
+            if not hits or hits[0].get("score", 0.0) < MIN_SCORE:
+                q = question.lower()
+                tag_guess = None
+                for pattern, tag in tag_map.items():
+                    if re.search(pattern, q):
+                        tag_guess = tag
+                        break
+                if tag_guess:
+                    fb_points = qdrant_scroll_by_tag(tag_guess)
+                    if fb_points:
+                        # in "hits"-Format überführen (Score=1.0 nur als Platzhalter, da wir Filter statt Ähnlichkeit nutzen)
+                        hits = [{"score": 1.0, "payload": p.get("payload", {})} for p in fb_points]
+
+            # 4) Antwort aus Treffern
+            print()
+            print(answer_from_hits(hits))
+            print("-" * 60)
+
+    except Exception as e:
+        fatal(f"Unerwarteter Fehler: {e}", 1)
+
+if __name__ == "__main__":
+    main()
